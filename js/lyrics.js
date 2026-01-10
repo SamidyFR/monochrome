@@ -30,6 +30,8 @@ export class LyricsManager {
     this.kuroshiroLoading = false;
     this.romajiTextCache = new Map(); // Cache: originalText -> convertedRomaji
     this.convertedTracksCache = new Set(); // Track IDs that have been fully converted
+    this.originalLinesCache = new Map(); // Cache: line element -> original innerHTML
+    this.isConverting = false; // Prevent overlapping conversions
   }
 
   // Load Kuroshiro from CDN (npm package uses Node.js path which doesn't work in browser)
@@ -55,11 +57,11 @@ export class LyricsManager {
       // Kuromoji uses XHR, not fetch, for loading dictionary files
       if (!window._originalXHROpen) {
         window._originalXHROpen = XMLHttpRequest.prototype.open;
-        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        XMLHttpRequest.prototype.open = function (method, url, ...rest) {
           const urlStr = url.toString();
-          if (urlStr.includes('/dict/') && urlStr.includes('.dat.gz')) {
+          if (urlStr.includes("/dict/") && urlStr.includes(".dat.gz")) {
             // Extract just the filename
-            const filename = urlStr.split('/').pop();
+            const filename = urlStr.split("/").pop();
             // Redirect to CDN
             const cdnUrl = `https://cdn.jsdelivr.net/npm/kuromoji@0.1.2/dict/${filename}`;
             return window._originalXHROpen.call(this, method, cdnUrl, ...rest);
@@ -73,8 +75,8 @@ export class LyricsManager {
         window._originalFetch = window.fetch;
         window.fetch = async (url, options) => {
           const urlStr = url.toString();
-          if (urlStr.includes('/dict/') && urlStr.includes('.dat.gz')) {
-            const filename = urlStr.split('/').pop();
+          if (urlStr.includes("/dict/") && urlStr.includes(".dat.gz")) {
+            const filename = urlStr.split("/").pop();
             const cdnUrl = `https://cdn.jsdelivr.net/npm/kuromoji@0.1.2/dict/${filename}`;
             console.log(`Redirecting dict fetch: ${filename} -> CDN`);
             return window._originalFetch(cdnUrl, options);
@@ -86,14 +88,14 @@ export class LyricsManager {
       // Load Kuroshiro from CDN
       if (!window.Kuroshiro) {
         await this.loadScript(
-          "https://unpkg.com/kuroshiro@1.2.0/dist/kuroshiro.min.js",
+          "https://unpkg.com/kuroshiro@1.2.0/dist/kuroshiro.min.js"
         );
       }
 
       // Load Kuromoji analyzer from CDN
       if (!window.KuromojiAnalyzer) {
         await this.loadScript(
-          "https://unpkg.com/kuroshiro-analyzer-kuromoji@1.1.0/dist/kuroshiro-analyzer-kuromoji.min.js",
+          "https://unpkg.com/kuroshiro-analyzer-kuromoji@1.1.0/dist/kuroshiro-analyzer-kuromoji.min.js"
         );
       }
 
@@ -108,7 +110,7 @@ export class LyricsManager {
       await this.kuroshiro.init(
         new KuromojiAnalyzer({
           dictPath: "/dict/", // This gets mangled but our interceptor fixes it
-        }),
+        })
       );
 
       this.kuroshiroLoaded = true;
@@ -183,7 +185,7 @@ export class LyricsManager {
       console.warn(
         "Romaji conversion failed for text:",
         text.substring(0, 30),
-        error,
+        error
       );
       return text;
     }
@@ -273,7 +275,7 @@ export class LyricsManager {
         if (duration) params.append("duration", duration.toString());
 
         const response = await fetch(
-          `https://lrclib.net/api/get?${params.toString()}`,
+          `https://lrclib.net/api/get?${params.toString()}`
         );
 
         if (response.ok) {
@@ -345,7 +347,7 @@ export class LyricsManager {
     a.href = url;
     a.download = buildTrackFilename(track, "LOSSLESS").replace(
       /\.flac$/,
-      ".lrc",
+      ".lrc"
     );
     document.body.appendChild(a);
     a.click();
@@ -364,6 +366,135 @@ export class LyricsManager {
       }
     }
     return currentIndex;
+  }
+
+  // Helper method to extract full line text from progress-text spans
+  extractLineText(lineElement) {
+    const spans = lineElement.querySelectorAll(".progress-text");
+    const chars = [];
+
+    spans.forEach((span) => {
+      const text = span.textContent.trim();
+      if (text) {
+        chars.push(text);
+      }
+    });
+
+    return chars.join("");
+  }
+
+  // Helper method to replace line content with romaji (single text, uses interpolate timing)
+  replaceLineWithRomaji(line, spans, romajiText) {
+    // Get the parent container that holds all the progress-text spans
+    const spansContainer = spans[0]?.parentElement;
+    if (!spansContainer) return;
+
+    // Save original HTML if not already saved
+    if (!this.originalLinesCache.has(line)) {
+      this.originalLinesCache.set(line, spansContainer.innerHTML);
+    }
+
+    // Inject romaji styles once (into shadow DOM if present)
+    this.injectRomajiStyles(line);
+
+    // Create a single span with the full romaji text
+    // Using the same class structure as original for styling compatibility
+    const romajiSpan = document.createElement("span");
+    romajiSpan.className = "progress-text romaji-converted";
+    romajiSpan.textContent = romajiText;
+
+    // Clear all existing spans and add the single romaji span
+    spansContainer.innerHTML = "";
+    spansContainer.appendChild(romajiSpan);
+  }
+
+  // Inject CSS for romaji highlighting into shadow DOM
+  injectRomajiStyles(line) {
+    // Find the shadow root or document
+    const root = line.getRootNode();
+    if (root._romajiStylesInjected) return;
+
+    const style = document.createElement("style");
+    style.textContent = `
+      /* Romaji converted text - base style (not active) */
+      .romaji-converted {
+        transition: color 0.3s ease;
+        color: rgba(255, 255, 255, 0.5);
+      }
+      
+      /* Active line - full highlight */
+      div.active-line {
+        color: var(--highlight-color, #93c5fd);
+      }
+    `;
+
+    if (root instanceof ShadowRoot) {
+      root.appendChild(style);
+    } else if (root.head) {
+      root.head.appendChild(style);
+    }
+
+    root._romajiStylesInjected = true;
+
+    // Also setup an observer to forward line opacity to romaji spans
+    this.setupLineStyleObserver(root);
+  }
+
+  // Observe class changes on lyrics-line and update romaji span styles
+  setupLineStyleObserver(root) {
+    if (root._lineStyleObserver) return;
+
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        const line = mutation.target;
+        if (!line.classList || !line.classList.contains("lyrics-line")) return;
+
+        const romajiSpan = line.querySelector(".romaji-converted");
+        if (!romajiSpan) return;
+
+        // Check if line has active-line class
+        if (line.classList.contains("active-line")) {
+          // Active line - full highlight
+          romajiSpan.style.color = "var(--highlight-color, #93c5fd)";
+          romajiSpan.style.setProperty("--line-progress", "100%");
+        } else {
+          // Inactive line - dim
+          romajiSpan.style.color = "rgba(255, 255, 255, 0.5)";
+          romajiSpan.style.setProperty("--line-progress", "0%");
+        }
+      });
+    });
+
+    observer.observe(root, {
+      attributes: true,
+      attributeFilter: ["class"],
+      subtree: true,
+    });
+
+    root._lineStyleObserver = observer;
+  }
+
+  // Restore original Japanese content for a line
+  restoreLineFromCache(line) {
+    const spansContainer = line.querySelector("span");
+    if (!spansContainer) return;
+
+    const originalHTML = this.originalLinesCache.get(line);
+    if (originalHTML) {
+      spansContainer.innerHTML = originalHTML;
+    }
+  }
+
+  // Restore all lines to original Japanese
+  restoreAllLines(amLyricsElement) {
+    if (!amLyricsElement) return;
+
+    const rootToTraverse = amLyricsElement.shadowRoot || amLyricsElement;
+    const lyricsLines = rootToTraverse.querySelectorAll(".lyrics-line");
+
+    lyricsLines.forEach((line) => {
+      this.restoreLineFromCache(line);
+    });
   }
 
   // Setup MutationObserver to convert lyrics in am-lyrics component
@@ -424,78 +555,77 @@ export class LyricsManager {
       return;
     }
 
-    // Find the root to traverse - check for shadow DOM first
-    const rootToTraverse = amLyricsElement.shadowRoot || amLyricsElement;
-
-    // Make sure Kuroshiro is ready
-    if (!this.kuroshiroLoaded) {
-      const success = await this.loadKuroshiro();
-      if (!success) {
-        console.warn("Cannot convert lyrics - Kuroshiro load failed");
-        return;
-      }
+    // Prevent overlapping conversions
+    if (this.isConverting) {
+      return;
     }
+    this.isConverting = true;
 
-    // Find all text nodes in the component
-    const textNodes = [];
-    const walker = document.createTreeWalker(
-      rootToTraverse,
-      NodeFilter.SHOW_TEXT,
-      null,
-      false,
-    );
+    try {
+      // Find the root to traverse - check for shadow DOM first
+      const rootToTraverse = amLyricsElement.shadowRoot || amLyricsElement;
 
-    let node;
-    while ((node = walker.nextNode())) {
-      textNodes.push(node);
-    }
-
-    // Convert Japanese text to Romaji (using async/await for Kuroshiro)
-    for (const textNode of textNodes) {
-      if (!textNode.parentElement) {
-        continue;
-      }
-
-      const parentTag = textNode.parentElement.tagName?.toLowerCase();
-      const parentClass = String(textNode.parentElement.className || "");
-
-      // Skip elements that shouldn't be converted
-      const skipTags = ["script", "style", "code", "input", "textarea", "time"];
-      if (skipTags.includes(parentTag)) {
-        continue;
-      }
-
-      const originalText = textNode.textContent;
-
-      // Skip progress indicators and timestamps (but NOT progress-text which is the actual lyrics!)
-      if (
-        (parentClass.includes("progress") &&
-          !parentClass.includes("progress-text")) ||
-        (parentClass.includes("time") &&
-          !parentClass.includes("progress-text")) ||
-        parentClass.includes("timestamp")
-      ) {
-        continue;
-      }
-
-      if (!originalText || originalText.trim().length === 0) {
-        continue;
-      }
-
-      // Check if contains Japanese - convert if we find Japanese
-      if (this.containsJapanese(originalText)) {
-        const romajiText = await this.convertToRomaji(originalText);
-
-        // Only update if conversion produced different text
-        if (romajiText && romajiText !== originalText) {
-          textNode.textContent = romajiText;
+      // Make sure Kuroshiro is ready
+      if (!this.kuroshiroLoaded) {
+        const success = await this.loadKuroshiro();
+        if (!success) {
+          console.warn("Cannot convert lyrics - Kuroshiro load failed");
+          return;
         }
       }
-    }
 
-    // Mark this track as converted
-    if (this.currentTrackId) {
-      this.convertedTracksCache.add(this.currentTrackId);
+      // NEW APPROACH: Find lyrics lines instead of individual text nodes
+      const lyricsLines = rootToTraverse.querySelectorAll(".lyrics-line");
+
+      if (lyricsLines.length === 0) {
+        return;
+      }
+
+      // Check if already fully converted (all lines have romaji-converted)
+      const unconvertedLines = Array.from(lyricsLines).filter(
+        (line) => !line.querySelector(".romaji-converted")
+      );
+
+      if (unconvertedLines.length === 0) {
+        return; // All lines already converted
+      }
+
+      // Process only unconverted lines
+      for (const line of unconvertedLines) {
+        const spans = line.querySelectorAll(".progress-text");
+
+        if (spans.length === 0) continue;
+
+        // Step 1: Extract full line text for proper context
+        const fullText = this.extractLineText(line);
+
+        if (!fullText || !this.containsJapanese(fullText)) {
+          continue;
+        }
+
+        // Skip if already converted (check first span)
+        const firstSpanText = spans[0].textContent.trim();
+        if (!this.containsJapanese(firstSpanText)) {
+          continue; // Already converted
+        }
+
+        // Step 2: Convert with FULL CONTEXT using Kuroshiro
+        const romajiText = await this.convertToRomaji(fullText);
+
+        if (!romajiText || romajiText === fullText) {
+          continue;
+        }
+
+        // Step 3: Replace all spans with single romaji text (uses interpolate timing)
+        this.replaceLineWithRomaji(line, spans, romajiText);
+      }
+
+      // Mark this track as converted
+      if (this.currentTrackId) {
+        this.convertedTracksCache.add(this.currentTrackId);
+      }
+    } finally {
+      this.isConverting = false;
     }
   }
 
@@ -522,9 +652,9 @@ export class LyricsManager {
         this.setupLyricsObserver(amLyricsElement);
         await this.convertLyricsContent(amLyricsElement);
       } else {
-        // Turning OFF: Stop observer
-        // Note: To restore original Japanese, we'd need to reload the component
+        // Turning OFF: Stop observer and restore original Japanese
         this.stopLyricsObserver();
+        this.restoreAllLines(amLyricsElement);
       }
     }
 
@@ -556,7 +686,9 @@ export async function openLyricsPanel(track, audioPlayer, lyricsManager) {
             <button id="close-side-panel-btn" class="btn-icon" title="Close">
                 ${SVG_CLOSE}
             </button>
-            <button id="romaji-toggle-btn" class="btn-icon" title="Toggle Romaji (Japanese to Latin)" data-enabled="${isRomajiMode}" style="color: ${isRomajiMode ? "var(--primary)" : ""}">
+            <button id="romaji-toggle-btn" class="btn-icon" title="Toggle Romaji (Japanese to Latin)" data-enabled="${isRomajiMode}" style="color: ${
+      isRomajiMode ? "var(--primary)" : ""
+    }">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <circle cx="12" cy="12" r="10"></circle>
                     <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
@@ -603,7 +735,7 @@ async function renderLyricsComponent(
   container,
   track,
   audioPlayer,
-  lyricsManager,
+  lyricsManager
 ) {
   container.innerHTML = '<div class="lyrics-loading">Loading lyrics...</div>';
 
@@ -656,7 +788,8 @@ async function renderLyricsComponent(
         const checkForLyrics = () => {
           const hasLyrics =
             amLyrics.querySelector(".lyric-line, [class*='lyric']") ||
-            (amLyrics.shadowRoot && amLyrics.shadowRoot.querySelector("[class*='lyric']")) ||
+            (amLyrics.shadowRoot &&
+              amLyrics.shadowRoot.querySelector("[class*='lyric']")) ||
             (amLyrics.textContent && amLyrics.textContent.length > 50);
           return hasLyrics;
         };
@@ -771,7 +904,7 @@ export async function renderLyricsInFullscreen(
   track,
   audioPlayer,
   lyricsManager,
-  container,
+  container
 ) {
   return renderLyricsComponent(container, track, audioPlayer, lyricsManager);
 }
