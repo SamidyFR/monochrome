@@ -1,0 +1,20 @@
+{
+    "api": [
+        "https://tidal-api.binimum.org",
+        "https://monochrome-api.samidy.com",
+        "https://triton.squid.wtf",
+        "https://wolf.qqdl.site"
+    ],
+    "streaming": [
+        "https://triton.squid.wtf",
+        "https://wolf.qqdl.site",
+        "https://maus.qqdl.site",
+        "https://vogel.qqdl.site",
+        "https://katze.qqdl.site",
+        "https://hund.qqdl.site",
+        "https://tidal.kinoplus.online",
+        "https://tidal-api.binimum.org",
+        "https://hifi-one.spotisaver.net",
+        "https://hifi-two.spotisaver.net"
+    ]
+}
